@@ -4,10 +4,15 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from unifi_protect_backup.database import (
+    STATUS_DOWNLOADED,
+    STATUS_DOWNLOADING,
     STATUS_FAILED,
+    STATUS_QUEUED,
     STATUS_UPLOADING,
+    claim_event_for_upload,
     claim_event_for_processing,
     create_database,
+    mark_event_downloaded,
     mark_event_downloading,
     mark_event_failed,
     migrate_database,
@@ -50,23 +55,43 @@ def test_processing_claim_suppresses_duplicates_and_allows_failed_retry(tmp_path
 def test_startup_migration_makes_abandoned_claims_retryable(tmp_path):
     async def run_test():
         db = await create_database(str(tmp_path / "events.sqlite"))
-        event = _event()
-
-        await db.execute(
-            """
-            INSERT INTO event_processing(id, status, updated_at)
-            VALUES (?, ?, ?)
-            """,
-            (event.id, STATUS_UPLOADING, 1.0),
-        )
+        active_statuses = [STATUS_QUEUED, STATUS_DOWNLOADING, STATUS_DOWNLOADED, STATUS_UPLOADING]
+        for index, status in enumerate(active_statuses):
+            await db.execute(
+                """
+                INSERT INTO event_processing(id, status, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (f"event-{index}", status, 1.0),
+            )
         await db.commit()
 
         await migrate_database(db)
 
-        async with db.execute("SELECT status FROM event_processing WHERE id = ?", (event.id,)) as cursor:
-            row = await cursor.fetchone()
-        assert row[0] == STATUS_FAILED
+        for index, _ in enumerate(active_statuses):
+            event_id = f"event-{index}"
+            async with db.execute("SELECT status FROM event_processing WHERE id = ?", (event_id,)) as cursor:
+                row = await cursor.fetchone()
+            assert row[0] == STATUS_FAILED
+            assert await claim_event_for_processing(db, event_id) is True
+
+        await db.close()
+
+    asyncio.run(run_test())
+
+
+def test_upload_claim_requires_downloaded_state(tmp_path):
+    async def run_test():
+        db = await create_database(str(tmp_path / "events.sqlite"))
+        event = _event()
+
         assert await claim_event_for_processing(db, event.id) is True
+        assert await mark_event_downloading(db, event.id) is True
+        assert await claim_event_for_upload(db, event.id) is False
+
+        await mark_event_downloaded(db, event.id)
+        assert await claim_event_for_upload(db, event.id) is True
+        assert await claim_event_for_upload(db, event.id) is False
 
         await db.close()
 
@@ -90,6 +115,10 @@ def test_parallel_uploaders_skip_duplicate_event_ids_before_upload(tmp_path):
                 upload_calls += 1
                 upload_started.set()
                 await asyncio.sleep(0.1)
+
+        assert await claim_event_for_processing(db, event.id) is True
+        assert await mark_event_downloading(db, event.id) is True
+        await mark_event_downloaded(db, event.id)
 
         await upload_queue.put((event, b"first"))
         await upload_queue.put((event, b"second"))

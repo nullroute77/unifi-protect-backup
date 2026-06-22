@@ -9,13 +9,14 @@ from uiprotect.data.nvr import Event
 
 STATUS_QUEUED = "queued"
 STATUS_DOWNLOADING = "downloading"
+STATUS_DOWNLOADED = "downloaded"
 STATUS_UPLOADING = "uploading"
 STATUS_UPLOADED = "uploaded"
 STATUS_FAILED = "failed"
 STATUS_IGNORED = "ignored"
 
 RETRYABLE_STATUSES = (STATUS_FAILED,)
-ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_DOWNLOADING, STATUS_UPLOADING)
+ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_DOWNLOADING, STATUS_DOWNLOADED, STATUS_UPLOADING)
 TERMINAL_STATUSES = (STATUS_UPLOADED, STATUS_IGNORED)
 
 
@@ -45,6 +46,7 @@ async def migrate_database(db: aiosqlite.Connection) -> None:
         )
         """
     )
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_event_processing_status ON event_processing(status)")
     now = _now()
     await db.execute(
         """
@@ -108,11 +110,11 @@ async def active_or_completed_event_ids(db: aiosqlite.Connection) -> set[str]:
         event_ids = {row[0] async for row in cursor}
 
     async with db.execute(
-        """
+        f"""
         SELECT id FROM event_processing
-        WHERE status != ?
+        WHERE status IN ({",".join("?" for _ in ACTIVE_STATUSES)})
         """,
-        (STATUS_FAILED,),
+        ACTIVE_STATUSES,
     ) as cursor:
         async for row in cursor:
             event_ids.add(row[0])
@@ -137,7 +139,7 @@ async def mark_event_downloading(db: aiosqlite.Connection, event_id: str) -> boo
 
 
 async def mark_event_downloaded(db: aiosqlite.Connection, event_id: str) -> None:
-    """Return a downloaded event to queued state while it waits in the upload queue."""
+    """Mark an event as downloaded while its video bytes wait in the upload queue."""
     await db.execute(
         """
         UPDATE event_processing
@@ -145,35 +147,22 @@ async def mark_event_downloaded(db: aiosqlite.Connection, event_id: str) -> None
         WHERE id = ?
           AND status = ?
         """,
-        (STATUS_QUEUED, _now(), event_id, STATUS_DOWNLOADING),
+        (STATUS_DOWNLOADED, _now(), event_id, STATUS_DOWNLOADING),
     )
     await db.commit()
 
 
 async def claim_event_for_upload(db: aiosqlite.Connection, event_id: str) -> bool:
     """Atomically claim an event immediately before uploading it."""
-    now = _now()
     cursor = await db.execute(
         """
-        INSERT OR IGNORE INTO event_processing(id, status, updated_at)
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ?)
-        """,
-        (event_id, STATUS_UPLOADING, now, event_id),
-    )
-    if cursor.rowcount == 1:
-        await db.commit()
-        return True
-
-    cursor = await db.execute(
-        f"""
         UPDATE event_processing
         SET status = ?, updated_at = ?
         WHERE id = ?
-          AND status IN ({",".join("?" for _ in (STATUS_QUEUED, STATUS_DOWNLOADING, STATUS_FAILED))})
+          AND status = ?
           AND NOT EXISTS (SELECT 1 FROM events WHERE id = ?)
         """,
-        (STATUS_UPLOADING, now, event_id, STATUS_QUEUED, STATUS_DOWNLOADING, STATUS_FAILED, event_id),
+        (STATUS_UPLOADING, _now(), event_id, STATUS_DOWNLOADED, event_id),
     )
     await db.commit()
     return cursor.rowcount == 1
@@ -197,6 +186,20 @@ async def mark_event_failed(db: aiosqlite.Connection, event_id: str) -> None:
           AND status NOT IN (?, ?)
         """,
         (STATUS_FAILED, now, event_id, STATUS_UPLOADED, STATUS_IGNORED),
+    )
+    await db.commit()
+
+
+async def mark_event_upload_failed(db: aiosqlite.Connection, event_id: str) -> None:
+    """Move a failed upload attempt back to retryable state."""
+    await db.execute(
+        """
+        UPDATE event_processing
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+          AND status = ?
+        """,
+        (STATUS_FAILED, _now(), event_id, STATUS_UPLOADING),
     )
     await db.commit()
 

@@ -19,7 +19,12 @@ from unifi_protect_backup.utils import (
     run_command,
     setup_event_logger,
 )
-from unifi_protect_backup.database import claim_event_for_upload, mark_event_failed, mark_event_uploaded
+from unifi_protect_backup.database import (
+    claim_event_for_upload,
+    mark_event_failed,
+    mark_event_upload_failed,
+    mark_event_uploaded,
+)
 
 
 class VideoUploader:
@@ -98,7 +103,7 @@ class VideoUploader:
                     await mark_event_uploaded(self._db, event.id)
                     self.logger.debug(f" Event {event.id} already exists in database, skipping")
                 except SubprocessException:
-                    await mark_event_failed(self._db, event.id)
+                    await mark_event_upload_failed(self._db, event.id)
                     self.logger.error(f" Failed to upload file: '{destination}'")
 
                 self.current_event = None
