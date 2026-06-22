@@ -7,27 +7,63 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Docker image tag to publish for a manual branch build
+        required: false
+        default: main
 
 jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
 
     steps:
-      - name: Get version from tag
-        id: tag_name
+      - name: Resolve release context
+        id: release_context
         run: |
-          echo "current_version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            current_version="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "image_tags<<EOF"
+              echo "ghcr.io/${GITHUB_REPOSITORY}:${current_version}"
+              echo "ghcr.io/${GITHUB_REPOSITORY}:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "current_version=${current_version}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            image_tag="${{ inputs.image_tag }}"
+            if [[ -z "$image_tag" ]]; then
+              image_tag="${GITHUB_REF_NAME:-manual}"
+            fi
+            image_tag="$(echo "$image_tag" | tr '/[:upper:]' '-[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^-+|-+$//g')"
+            if [[ -z "$image_tag" ]]; then
+              image_tag="manual"
+            fi
+            {
+              echo "image_tags<<EOF"
+              echo "ghcr.io/${GITHUB_REPOSITORY}:${image_tag}"
+              echo "ghcr.io/${GITHUB_REPOSITORY}:${image_tag}-${GITHUB_SHA::7}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "current_version=${image_tag}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
         shell: bash
 
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Get Changelog Entry
+        if: steps.release_context.outputs.is_release == 'true'
         id: changelog_reader
         uses: mindsers/changelog-reader-action@v2
         with:
-          version: ${{ steps.tag_name.outputs.current_version }}
+          version: ${{ steps.release_context.outputs.current_version }}
           path: ./CHANGELOG.md
 
       - name: Set up Python
@@ -65,22 +101,23 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.tag_name.outputs.current_version }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.release_context.outputs.image_tags }}
 
       - name: Create GitHub release
+        if: steps.release_context.outputs.is_release == 'true'
         id: create_release
         uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: v${{ steps.release_context.outputs.current_version }}
           body: ${{ steps.changelog_reader.outputs.changes }}
           files: dist/*
           draft: false
           prerelease: false
 
       - name: Publish to PyPI
+        if: steps.release_context.outputs.is_release == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
