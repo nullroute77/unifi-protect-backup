@@ -29,6 +29,7 @@ from unifi_protect_backup.utils import (
     setup_logging,
 )
 
+from unifi_protect_backup.database import create_database, migrate_database
 from unifi_protect_backup.uiprotect_patch import monkey_patch_experimental_downloader
 
 logger = logging.getLogger(__name__)
@@ -40,17 +41,6 @@ logger = logging.getLogger(__name__)
 # https://github.com/uilibs/uiprotect/pull/249
 # Since it has not progressed, we will for now patch in the functionality ourselves
 monkey_patch_experimental_downloader()
-
-
-async def create_database(path: str):
-    """Create sqlite database and creates the events abd backups tables."""
-    db = await aiosqlite.connect(path)
-    await db.execute("CREATE TABLE events(id PRIMARY KEY, type, camera_id, start REAL, end REAL)")
-    await db.execute(
-        "CREATE TABLE backups(id REFERENCES events(id) ON DELETE CASCADE, remote, path, PRIMARY KEY (id, remote))"
-    )
-    await db.commit()
-    return db
 
 
 class UnifiProtectBackup:
@@ -266,6 +256,7 @@ class UnifiProtectBackup:
 
             # Enable foreign keys in the database
             await self._db.execute("PRAGMA foreign_keys = ON;")
+            await migrate_database(self._db)
 
             # Create downloader task
             #   This will download video files to its buffer
@@ -305,7 +296,12 @@ class UnifiProtectBackup:
             #   This will connect to the unifi protect websocket and listen for events. When one is detected it will
             #   be added to the queue of events to download
             event_listener = EventListener(
-                download_queue, self._protect, self.detection_types, self.ignore_cameras, self.cameras
+                download_queue,
+                self._protect,
+                self._db,
+                self.detection_types,
+                self.ignore_cameras,
+                self.cameras,
             )
             tasks.append(event_listener.start())
 

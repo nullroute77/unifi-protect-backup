@@ -7,8 +7,6 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlite3 import IntegrityError
-
 import aiosqlite
 import pytz
 from aiohttp.client_exceptions import ClientPayloadError
@@ -25,6 +23,12 @@ from unifi_protect_backup.utils import (
     human_readable_size,
     run_command,
     setup_event_logger,
+)
+from unifi_protect_backup.database import (
+    mark_event_downloaded,
+    mark_event_downloading,
+    mark_event_failed,
+    mark_event_ignored,
 )
 
 
@@ -96,6 +100,7 @@ class VideoDownloader:
                 self.logger.debug("Waiting for rate limit")
                 await self._limiter.acquire()
 
+            event = None
             try:
                 # Wait for unifi protect to be connected
                 await self._protect.connect_event.wait()
@@ -104,6 +109,11 @@ class VideoDownloader:
 
                 self.current_event = event
                 self.logger = logging.LoggerAdapter(self.base_logger, {"event": f" [{event.id}]"})
+
+                if not await mark_event_downloading(self._db, event.id):
+                    self.logger.debug("Event already queued/in progress; skipping duplicate")
+                    self.current_event = None
+                    continue
 
                 # Fix timezones since uiprotect sets all timestamps to UTC. Instead localize them to
                 # the timezone of the unifi protect NVR.
@@ -128,6 +138,7 @@ class VideoDownloader:
                 # Skip invalid events
                 if not self._valid_event(event):
                     await self._ignore_event(event)
+                    self.current_event = None
                     continue
 
                 # Unifi protect does not return full video clips if the clip is requested too soon.
@@ -159,6 +170,9 @@ class VideoDownloader:
                             "Event has failed to download 10 times in a row. Permanently ignoring this event"
                         )
                         await self._ignore_event(event)
+                    else:
+                        await mark_event_failed(self._db, event.id)
+                    self.current_event = None
                     continue
 
                 # Remove successfully downloaded event from failures list
@@ -170,11 +184,17 @@ class VideoDownloader:
                     await self._check_video_length(video, duration)
 
                 await self.upload_queue.put((event, video))
+                await mark_event_downloaded(self._db, event.id)
                 self.logger.debug("Added to upload queue")
                 self.current_event = None
 
             except Exception as e:
-                self.logger.error(f"Unexpected exception occurred, abandoning event {event.id}:", exc_info=e)
+                if event is not None:
+                    await mark_event_failed(self._db, event.id)
+                    self.current_event = None
+                    self.logger.error(f"Unexpected exception occurred, abandoning event {event.id}:", exc_info=e)
+                else:
+                    self.logger.error("Unexpected exception occurred:", exc_info=e)
 
     async def _download(self, event: Event) -> Optional[bytes]:
         """Download the video clip for the given event."""
@@ -199,15 +219,7 @@ class VideoDownloader:
 
     async def _ignore_event(self, event):
         self.logger.warning("Ignoring event")
-        try:
-            await self._db.execute(
-                "INSERT INTO events VALUES "
-                f"('{event.id}', '{event.type.value}', '{event.camera_id}',"
-                f"'{event.start.timestamp()}', '{event.end.timestamp()}')"
-            )
-        except IntegrityError:
-            self.logger.debug(f"Event {event.id} already exists in database, skipping")
-        await self._db.commit()
+        await mark_event_ignored(self._db, event)
 
     async def _check_video_length(self, video, duration):
         """Check if the downloaded event is at least the length of the event, warn otherwise.

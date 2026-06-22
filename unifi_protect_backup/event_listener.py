@@ -2,14 +2,15 @@
 
 import asyncio
 import logging
-from time import sleep
 from typing import Set
 
+import aiosqlite
 from uiprotect.api import ProtectApiClient
 from uiprotect.websocket import WebsocketState
 from uiprotect.data.nvr import Event
 from uiprotect.data.websocket import WSAction, WSSubscriptionMessage
 
+from unifi_protect_backup.database import claim_event_for_processing
 from unifi_protect_backup.utils import normalize_event_id, wanted_event_type
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class EventListener:
         self,
         event_queue: asyncio.Queue,
         protect: ProtectApiClient,
+        db: aiosqlite.Connection,
         detection_types: Set[str],
         ignore_cameras: Set[str],
         cameras: Set[str],
@@ -38,6 +40,7 @@ class EventListener:
         """
         self._event_queue: asyncio.Queue = event_queue
         self._protect: ProtectApiClient = protect
+        self._db: aiosqlite.Connection = db
         self._unsub = None
         self._unsub_websocketstate = None
         self.detection_types: Set[str] = detection_types
@@ -69,17 +72,26 @@ class EventListener:
         if not wanted_event_type(msg.new_obj, self.detection_types, self.cameras, self.ignore_cameras):
             return
 
-        # TODO: Will this even work? I think it will block the async loop
-        while self._event_queue.full():
-            logger.extra_debug("Event queue full, waiting 1s...")  # type: ignore
-            sleep(1)
-
         # Normalize the event ID so it matches what the API returns
         msg.new_obj.id = normalize_event_id(msg.new_obj.id)
 
-        self._event_queue.put_nowait(msg.new_obj)
+        task = asyncio.create_task(self._queue_event(msg.new_obj))
+        task.add_done_callback(self._log_queue_task_result)
 
-        logger.debug(f"Adding event {msg.new_obj.id} to queue (Current download queue={self._event_queue.qsize()})")
+    @staticmethod
+    def _log_queue_task_result(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception as e:
+            logger.error("Unexpected exception occurred while queueing event:", exc_info=e)
+
+    async def _queue_event(self, event: Event) -> None:
+        if not await claim_event_for_processing(self._db, event.id):
+            logger.debug(f"Event {event.id} already queued/in progress; skipping duplicate")
+            return
+
+        await self._event_queue.put(event)
+        logger.debug(f"Adding event {event.id} to queue (Current download queue={self._event_queue.qsize()})")
 
     def _websocket_state_callback(self, state: WebsocketState) -> None:
         """Websocket state message callback.

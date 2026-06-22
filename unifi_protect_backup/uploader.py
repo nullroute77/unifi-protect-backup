@@ -19,6 +19,7 @@ from unifi_protect_backup.utils import (
     run_command,
     setup_event_logger,
 )
+from unifi_protect_backup.database import claim_event_for_upload, mark_event_failed, mark_event_uploaded
 
 
 class VideoUploader:
@@ -69,6 +70,7 @@ class VideoUploader:
         """
         self.logger.info("Starting Uploader")
         while True:
+            event = None
             try:
                 event, video = await self.upload_queue.get()
                 self.current_event = event
@@ -85,18 +87,29 @@ class VideoUploader:
                 self.logger.debug(f" Destination: {destination}")
 
                 try:
+                    if not await claim_event_for_upload(self._db, event.id):
+                        self.logger.debug("Event already queued/in progress; skipping duplicate upload")
+                        self.current_event = None
+                        continue
                     await self._upload_video(video, destination, self._rclone_args)
                     await self._update_database(event, destination)
                     self.logger.debug("Uploaded")
                 except IntegrityError:
+                    await mark_event_uploaded(self._db, event.id)
                     self.logger.debug(f" Event {event.id} already exists in database, skipping")
                 except SubprocessException:
+                    await mark_event_failed(self._db, event.id)
                     self.logger.error(f" Failed to upload file: '{destination}'")
 
                 self.current_event = None
 
             except Exception as e:
-                self.logger.error(f"Unexpected exception occurred, abandoning event {event.id}:", exc_info=e)
+                if event is not None:
+                    await mark_event_failed(self._db, event.id)
+                    self.current_event = None
+                    self.logger.error(f"Unexpected exception occurred, abandoning event {event.id}:", exc_info=e)
+                else:
+                    self.logger.error("Unexpected exception occurred:", exc_info=e)
 
     async def _upload_video(self, video: bytes, destination: pathlib.Path, rclone_args: str):
         """Upload video using rclone.
@@ -122,19 +135,22 @@ class VideoUploader:
         assert isinstance(event.start, datetime)
         assert isinstance(event.end, datetime)
         await self._db.execute(
-            "INSERT INTO events VALUES "
-            f"('{event.id}', '{event.type.value}', '{event.camera_id}',"
-            f"'{event.start.timestamp()}', '{event.end.timestamp()}')"
+            """
+            INSERT INTO events VALUES (?, ?, ?, ?, ?)
+            """,
+            (event.id, event.type.value, event.camera_id, event.start.timestamp(), event.end.timestamp()),
         )
 
         remote, file_path = str(destination).split(":")
         await self._db.execute(
-            f"""INSERT INTO backups VALUES
-                ('{event.id}', '{remote}', '{file_path}')
             """
+            INSERT INTO backups VALUES (?, ?, ?)
+            """,
+            (event.id, remote, file_path),
         )
 
         await self._db.commit()
+        await mark_event_uploaded(self._db, event.id)
 
     async def _generate_file_path(self, event: Event) -> pathlib.Path:
         """Generate the rclone destination path for the provided event.

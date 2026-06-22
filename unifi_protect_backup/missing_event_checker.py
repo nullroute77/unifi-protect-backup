@@ -5,8 +5,6 @@ import logging
 from datetime import datetime
 from typing import AsyncIterator, List, Set
 
-from sqlite3 import IntegrityError
-
 import aiosqlite
 from dateutil.relativedelta import relativedelta
 from uiprotect import ProtectApiClient
@@ -14,7 +12,12 @@ from uiprotect.data.nvr import Event
 from uiprotect.data.types import EventType
 
 from unifi_protect_backup import VideoDownloader, VideoUploader
-from unifi_protect_backup.utils import EVENT_TYPES_MAP, wanted_event_type
+from unifi_protect_backup.database import (
+    active_or_completed_event_ids,
+    claim_event_for_processing,
+    mark_event_ignored,
+)
+from unifi_protect_backup.utils import EVENT_TYPES_MAP, normalize_event_id, wanted_event_type
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,8 @@ class MissingEventChecker:
                 break  # There were no events to backup
 
             # Filter out on-going events
+            for event in events_chunk:
+                event.id = normalize_event_id(event.id)
             unifi_events = {event.id: event for event in events_chunk if event.end is not None}
 
             if not unifi_events:
@@ -88,26 +93,7 @@ class MissingEventChecker:
             # Next chunks start time should be the start of the oldest complete event in the current chunk
             start_time = max([event.start for event in unifi_events.values() if event.end is not None])
 
-            # Get list of events that have been backed up from the database
-
-            # events(id, type, camera_id, start, end)
-            async with self._db.execute("SELECT * FROM events") as cursor:
-                rows = await cursor.fetchall()
-                db_event_ids = {row[0] for row in rows}
-
-            # Prevent re-adding events currently in the download/upload queue
-            downloading_event_ids = {event.id for event in self._downloader.download_queue._queue}  # type: ignore
-            current_download = self._downloader.current_event
-            if current_download is not None:
-                downloading_event_ids.add(current_download.id)
-
-            uploading_event_ids = {event.id for event, video in self._downloader.upload_queue._queue}  # type: ignore
-            for uploader in self._uploaders:
-                current_upload = uploader.current_event
-                if current_upload is not None:
-                    uploading_event_ids.add(current_upload.id)
-
-            existing_ids = db_event_ids | downloading_event_ids | uploading_event_ids
+            existing_ids = await active_or_completed_event_ids(self._db)
             missing_events = {
                 event_id: event for event_id, event in unifi_events.items() if event_id not in existing_ids
             }
@@ -134,15 +120,7 @@ class MissingEventChecker:
 
         async for event in self._get_missing_events():
             logger.extra_debug(f"Ignoring event '{event.id}'")
-            try:
-                await self._db.execute(
-                    "INSERT INTO events VALUES "
-                    f"('{event.id}', '{event.type.value}', '{event.camera_id}',"
-                    f"'{event.start.timestamp()}', '{event.end.timestamp()}')"
-                )
-            except IntegrityError:
-                logger.debug(f"Event {event.id} already exists in database, skipping")
-        await self._db.commit()
+            await mark_event_ignored(self._db, event)
 
     async def start(self):
         """Run main loop."""
@@ -171,6 +149,9 @@ class MissingEventChecker:
                         f" ({event.start.strftime('%Y-%m-%dT%H-%M-%S')} -"
                         f" {event.end.strftime('%Y-%m-%dT%H-%M-%S')})"
                     )
+                    if not await claim_event_for_processing(self._db, event.id):
+                        logger.debug(f"Event {event.id} already queued/in progress; skipping duplicate")
+                        continue
                     await self._download_queue.put(event)
 
             except Exception as e:
