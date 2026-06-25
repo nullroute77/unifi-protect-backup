@@ -1,9 +1,10 @@
 # noqa: D100
 
+import copy
 import logging
 import pathlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlite3 import IntegrityError
 
@@ -180,9 +181,10 @@ class VideoUploader:
         assert isinstance(event.camera_id, str)
         assert isinstance(event.start, datetime)
         assert isinstance(event.end, datetime)
+        event_for_path = self._event_for_path(event)
 
         format_context = {
-            "event": event,
+            "event": event_for_path,
             "duration_seconds": (event.end - event.start).total_seconds(),
             "detection_type": f"{event.type.value} ({' '.join(event.smart_detect_types)})"
             if event.smart_detect_types
@@ -194,3 +196,20 @@ class VideoUploader:
         file_path = re.sub(r"[^\w\-_\.\(\)/ ]", "", file_path)  # Sanitize any invalid chars
 
         return pathlib.Path(f"{self._rclone_destination}/{file_path}")
+
+    def _event_for_path(self, event: Event) -> Event:
+        event_for_path = copy.copy(event)
+        event_for_path.start = self._datetime_for_path(event.start)
+        event_for_path.end = self._datetime_for_path(event.end)
+        return event_for_path
+
+    def _datetime_for_path(self, dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(self._path_timezone())
+
+    def _path_timezone(self):
+        try:
+            return self._protect.bootstrap.nvr.timezone
+        except AttributeError:
+            return datetime.now(timezone.utc).astimezone().tzinfo

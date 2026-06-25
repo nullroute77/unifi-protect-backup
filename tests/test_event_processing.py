@@ -2,6 +2,7 @@ import asyncio
 import pathlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from unifi_protect_backup.database import (
     STATUS_DOWNLOADED,
@@ -139,5 +140,45 @@ def test_parallel_uploaders_skip_duplicate_event_ids_before_upload(tmp_path):
         assert upload_calls == 1
 
         await db.close()
+
+    asyncio.run(run_test())
+
+
+def test_file_path_formats_event_times_in_nvr_timezone():
+    async def run_test():
+        class FakeProtect:
+            pass
+
+        connect_event = asyncio.Event()
+        connect_event.set()
+        protect = FakeProtect()
+        protect.connect_event = connect_event
+        protect.bootstrap = SimpleNamespace(
+            nvr=SimpleNamespace(timezone=ZoneInfo("America/Chicago")),
+            cameras={"camera-1": SimpleNamespace(name="Front Door")},
+        )
+        start = datetime(2026, 6, 25, 14, 43, 41, tzinfo=timezone.utc)
+        event = SimpleNamespace(
+            id="event-1",
+            type=SimpleNamespace(value="motion"),
+            camera_id="camera-1",
+            start=start,
+            end=start + timedelta(seconds=10),
+            smart_detect_types=[],
+        )
+        uploader = VideoUploader(
+            protect,
+            VideoQueue(1024),
+            "b2:bucket",
+            "",
+            "{event.start:%Y-%m-%dT%H-%M-%S}.mp4",
+            None,
+            False,
+        )
+
+        path = await uploader._generate_file_path(event)
+
+        assert str(path).endswith("2026-06-25T09-43-41.mp4")
+        assert event.start == start
 
     asyncio.run(run_test())
