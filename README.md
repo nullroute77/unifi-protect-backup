@@ -243,6 +243,8 @@ always take priority over environment variables):
 - `MAX_EVENT_LENGTH`
 - `EXPERIMENTAL_DOWNLOADER`
 - `PARALLEL_UPLOADS`
+- `PRIORITY_CAMERAS`
+- `CAMERA_PRIORITIES`
 
 ## File path formatting
 
@@ -306,6 +308,23 @@ Only `CAMERA_ID_3` will be backed up.
 
 ### Note about unifi protect accounts
 It is possible to limit what cameras a unifi protect accounts can see. If an account does not have access to a camera this tool will never see it as available so it will not be impacted by the above arguments.
+
+## Priority cameras
+
+Download and upload ordering can be prioritized by camera name or camera ID without changing which events are backed up.
+Set `PRIORITY_CAMERAS` to a comma-separated list of exact camera names or IDs to give those cameras the default high upload priority of 100:
+
+```
+PRIORITY_CAMERAS="MB Registers,BS Registers"
+```
+
+Use `CAMERA_PRIORITIES` for explicit numeric priorities. Higher numbers download and upload first, while normal cameras use priority 0:
+
+```
+CAMERA_PRIORITIES="MB Registers=100,BS Registers=90,MB Entrance=50"
+```
+
+FIFO order is preserved within the same priority, and older normal-priority events age upward so they are not starved by constant high-priority traffic.
 
 # A note about `rclone` backends and disk wear
 This tool attempts to not write the downloaded files to disk to minimise disk wear, and instead streams them directly to 

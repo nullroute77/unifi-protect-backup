@@ -121,6 +121,11 @@ class VideoDownloader:
                 event.end = event.end.replace(tzinfo=pytz.utc).astimezone(self._protect.bootstrap.nvr.timezone)
 
                 self.logger.info(f"Downloading event: {event.id}")
+                download_camera_name = getattr(event, "_download_queue_camera_name", None) or event.camera_id
+                self.logger.debug(
+                    f'Downloading event {event.id} camera="{download_camera_name}" '
+                    f'priority={getattr(event, "_download_queue_priority", 0)}'
+                )
                 self.logger.debug(f"Remaining Download Queue: {self.download_queue.qsize()}")
                 output_queue_current_size = human_readable_size(self.upload_queue.qsize())
                 output_queue_max_size = human_readable_size(self.upload_queue.maxsize)
@@ -183,8 +188,8 @@ class VideoDownloader:
                 if self._has_ffprobe:
                     await self._check_video_length(video, duration)
 
-                await self.upload_queue.put((event, video))
                 await mark_event_downloaded(self._db, event.id)
+                await self.upload_queue.put((event, video))
                 self.logger.debug("Added to upload queue")
                 self.current_event = None
 

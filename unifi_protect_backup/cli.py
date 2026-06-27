@@ -261,6 +261,18 @@ a lot of failed downloads with the default downloader.
     type=int,
     help="Max number of parallel uploads to allow",
 )
+@click.option(
+    "--priority-cameras",
+    default="",
+    envvar="PRIORITY_CAMERAS",
+    help="Comma-separated camera names or IDs that should receive default high upload priority",
+)
+@click.option(
+    "--camera-priorities",
+    default="",
+    envvar="CAMERA_PRIORITIES",
+    help="Comma-separated camera priority mappings, e.g. 'Camera Name=100,camera_id=90'",
+)
 def main(**kwargs):
     """Python based tool for backing up Unifi Protect event clips as they occur."""
     try:

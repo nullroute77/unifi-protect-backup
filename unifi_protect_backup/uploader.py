@@ -84,6 +84,11 @@ class VideoUploader:
                 self.logger = logging.LoggerAdapter(self.base_logger, {"event": f" [{event.id}]"})
 
                 self.logger.info(f"Uploading event: {event.id}")
+                upload_camera_name = getattr(event, "_upload_queue_camera_name", None) or event.camera_id
+                self.logger.debug(
+                    f'Uploading event {event.id} camera="{upload_camera_name}" '
+                    f'priority={getattr(event, "_upload_queue_priority", 0)}'
+                )
                 self.logger.debug(
                     f" Remaining Upload Queue: {self.upload_queue.qsize_files()}"
                     f" ({human_readable_size(self.upload_queue.qsize())})"

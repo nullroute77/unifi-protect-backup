@@ -48,6 +48,8 @@ ENV RCLONE_DESTINATION=local:/data
 ENV VERBOSITY="v"
 ENV TZ=UTC
 ENV IGNORE_CAMERAS=""
+ENV PRIORITY_CAMERAS=""
+ENV CAMERA_PRIORITIES=""
 ENV SQLITE_PATH=/config/database/events.sqlite
 
 # Fixes issue where `platformdirs` is unable to properly detect the user directory

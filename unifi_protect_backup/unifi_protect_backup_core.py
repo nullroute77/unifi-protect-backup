@@ -22,9 +22,11 @@ from unifi_protect_backup import (
     notifications,
 )
 from unifi_protect_backup.utils import (
+    EventQueue,
     SubprocessException,
     VideoQueue,
     human_readable_size,
+    parse_camera_priority_config,
     run_command,
     setup_logging,
 )
@@ -77,6 +79,8 @@ class UnifiProtectBackup:
         port: int = 443,
         use_experimental_downloader: bool = False,
         parallel_uploads: int = 1,
+        priority_cameras: str = "",
+        camera_priorities: str = "",
     ):
         """Will configure logging settings and the Unifi Protect API (but not actually connect).
 
@@ -115,6 +119,8 @@ class UnifiProtectBackup:
             use_experimental_downloader (bool): Use the new experimental downloader (the same method as used by the
                                                 webUI)
             parallel_uploads (int): Max number of parallel uploads to allow
+            priority_cameras (str): Comma-separated camera names/IDs with default high upload priority
+            camera_priorities (str): Comma-separated camera=priority mappings
 
         """
         self.color_logging = color_logging
@@ -156,6 +162,8 @@ class UnifiProtectBackup:
         logger.debug(f"  {max_event_length=}s")
         logger.debug(f"  {use_experimental_downloader=}")
         logger.debug(f"  {parallel_uploads=}")
+        logger.debug(f"  {priority_cameras=}")
+        logger.debug(f"  {camera_priorities=}")
 
         self.rclone_destination = rclone_destination
         self.retention = retention
@@ -193,6 +201,7 @@ class UnifiProtectBackup:
         self._max_event_length = timedelta(seconds=max_event_length)
         self._use_experimental_downloader = use_experimental_downloader
         self._parallel_uploads = parallel_uploads
+        self._priority_config = parse_camera_priority_config(priority_cameras, camera_priorities)
 
     async def start(self):
         """Bootstrap the backup process and kick off the main loop.
@@ -242,6 +251,10 @@ class UnifiProtectBackup:
             # Print timezone info for debugging
             logger.debug(f"NVR TZ: {self._protect.bootstrap.nvr.timezone}")
             logger.debug(f"Local TZ: {datetime.now(timezone.utc).astimezone().tzinfo}")
+            if self._priority_config.priorities:
+                logger.info(f"Priority cameras: {self._priority_config.priorities}")
+            else:
+                logger.info("Priority cameras: none")
 
             tasks = []
 
@@ -251,8 +264,15 @@ class UnifiProtectBackup:
             else:
                 self._db = await aiosqlite.connect(self._sqlite_path)
 
-            download_queue = asyncio.Queue()
-            upload_queue = VideoQueue(self._download_buffer_size)
+            download_queue = EventQueue(
+                protect=self._protect,
+                priority_config=self._priority_config,
+            )
+            upload_queue = VideoQueue(
+                self._download_buffer_size,
+                protect=self._protect,
+                priority_config=self._priority_config,
+            )
 
             # Enable foreign keys in the database
             await self._db.execute("PRAGMA foreign_keys = ON;")

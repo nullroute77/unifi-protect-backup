@@ -1,8 +1,10 @@
 """Utility functions used throughout the code, kept here to allow re use and/or minimize clutter elsewhere."""
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional, Set
 
@@ -15,6 +17,9 @@ from uiprotect.data.types import EventType, SmartDetectObjectType, SmartDetectAu
 from unifi_protect_backup import notifications
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PRIORITY_CAMERA_PRIORITY = 100
+DEFAULT_PRIORITY_AGING_SECONDS = 60
 
 
 def add_logging_level(levelName: str, levelNum: int, methodName: Optional[str] = None) -> None:
@@ -388,32 +393,273 @@ async def run_command(cmd: str, data=None):
     return proc.returncode, stdout, stderr
 
 
-class VideoQueue(asyncio.Queue):
-    """A queue that limits the number of bytes it can store rather than discrete entries."""
+@dataclass
+class CameraPriorityConfig:
+    """Priority settings for upload queue camera ordering."""
 
-    def __init__(self, *args, **kwargs):
+    priorities: dict[str, int]
+
+
+@dataclass
+class _UploadQueueItem:
+    """Internal upload queue entry with priority metadata."""
+
+    event: Event
+    video: bytes
+    base_priority: int
+    sequence: int
+    enqueued_at: float
+    camera_name: str | None
+
+
+@dataclass
+class _EventQueueItem:
+    """Internal download queue entry with priority metadata."""
+
+    event: Event
+    base_priority: int
+    sequence: int
+    enqueued_at: float
+    camera_name: str | None
+
+
+def parse_csv_list(value) -> list[str]:
+    """Parse a comma-separated environment value into trimmed entries."""
+    if value is None:
+        return []
+    if isinstance(value, (tuple, list)):
+        values = value
+    else:
+        values = str(value).split(",")
+    return [item.strip() for item in values if item.strip()]
+
+
+def parse_camera_priority_config(priority_cameras="", camera_priorities="") -> CameraPriorityConfig:
+    """Parse PRIORITY_CAMERAS and CAMERA_PRIORITIES into a camera priority map."""
+    priorities = {
+        camera: DEFAULT_PRIORITY_CAMERA_PRIORITY
+        for camera in parse_csv_list(priority_cameras)
+    }
+
+    for entry in parse_csv_list(camera_priorities):
+        if "=" not in entry:
+            logger.warning(f"Ignoring invalid CAMERA_PRIORITIES entry '{entry}': expected camera=priority")
+            continue
+
+        camera, priority = entry.split("=", 1)
+        camera = camera.strip()
+        priority = priority.strip()
+        if not camera:
+            logger.warning(f"Ignoring invalid CAMERA_PRIORITIES entry '{entry}': camera is empty")
+            continue
+        try:
+            priorities[camera] = int(priority)
+        except ValueError:
+            logger.warning(f"Ignoring invalid CAMERA_PRIORITIES entry '{entry}': priority must be an integer")
+
+    return CameraPriorityConfig(priorities)
+
+
+class EventQueue(asyncio.Queue):
+    """A priority-aware queue for events waiting to download."""
+
+    def __init__(
+        self,
+        maxsize=0,
+        *,
+        protect: ProtectApiClient | None = None,
+        priority_config: CameraPriorityConfig | None = None,
+        priority_aging_seconds: int = DEFAULT_PRIORITY_AGING_SECONDS,
+    ):
         """Init."""
-        super().__init__(*args, **kwargs)
+        super().__init__(maxsize=maxsize)
+        self._protect = protect
+        self._priority_config = priority_config or CameraPriorityConfig({})
+        self._priority_aging_seconds = priority_aging_seconds
+        self._sequence = 0
+
+    def _init(self, maxsize):
+        self._queue = []
+
+    def _get(self):
+        index = self._best_item_index()
+        data = self._queue.pop(index)
+
+        normal_events_ahead = 0
+        if data.base_priority > 0:
+            normal_events_ahead = sum(1 for item in self._queue[:index] if item.base_priority == 0)
+        if normal_events_ahead:
+            logger.debug(
+                f"Priority queue selected high-priority event before {normal_events_ahead} normal-priority events"
+            )
+
+        return data.event
+
+    def _put(self, item: _EventQueueItem):
+        self._queue.append(item)
+
+    def _best_item_index(self) -> int:
+        now = time.monotonic()
+        best_index = 0
+        best_key = self._priority_key(self._queue[0], now)
+        for index, item in enumerate(self._queue[1:], start=1):
+            key = self._priority_key(item, now)
+            if key > best_key:
+                best_index = index
+                best_key = key
+        return best_index
+
+    def _priority_key(self, item: _EventQueueItem, now: float) -> tuple[float, int]:
+        age_priority = 0
+        if self._priority_aging_seconds > 0:
+            age_priority = (now - item.enqueued_at) / self._priority_aging_seconds
+        return item.base_priority + age_priority, -item.sequence
+
+    async def put(self, item: Event):
+        """Put an event into the download queue."""
+        queue_item = await self._queue_item(item)
+
+        while self.full():
+            putter = self._get_loop().create_future()  # type: ignore
+            self._putters.append(putter)  # type: ignore
+            try:
+                await putter
+            except:  # noqa: E722
+                putter.cancel()
+                try:
+                    self._putters.remove(putter)  # type: ignore
+                except ValueError:
+                    pass
+                if not self.full() and not putter.cancelled():
+                    self._wakeup_next(self._putters)  # type: ignore
+                raise
+        return self._put_queue_item_nowait(queue_item)
+
+    def put_nowait(self, item: Event):
+        """Put an event into the download queue without blocking."""
+        queue_item = self._queue_item_nowait(item)
+        if self.full():
+            raise asyncio.QueueFull
+        self._put_queue_item_nowait(queue_item)
+
+    def _put_queue_item_nowait(self, queue_item: _EventQueueItem):
+        self._put(queue_item)
+        self._unfinished_tasks += 1  # type: ignore
+        self._finished.clear()  # type: ignore
+        self._wakeup_next(self._getters)  # type: ignore
+
+    async def _queue_item(self, event: Event) -> _EventQueueItem:
+        camera_name = await self._get_camera_name(event)
+        return self._build_queue_item(event, camera_name)
+
+    def _queue_item_nowait(self, event: Event) -> _EventQueueItem:
+        camera_name = getattr(event, "camera_name", None)
+        return self._build_queue_item(event, camera_name)
+
+    def _build_queue_item(self, event: Event, camera_name: str | None) -> _EventQueueItem:
+        priority = self._camera_priority(event, camera_name)
+        setattr(event, "_download_queue_priority", priority)
+        setattr(event, "_download_queue_camera_name", camera_name)
+        queue_item = _EventQueueItem(
+            event=event,
+            base_priority=priority,
+            sequence=self._sequence,
+            enqueued_at=time.monotonic(),
+            camera_name=camera_name,
+        )
+        self._sequence += 1
+        logger.debug(
+            f'Queued download event {event.id} camera="{camera_name or event.camera_id}" priority={priority}'
+        )
+        return queue_item
+
+    def _camera_priority(self, event: Event, camera_name: str | None) -> int:
+        camera_id_priority = self._priority_config.priorities.get(event.camera_id, 0)
+        camera_name_priority = self._priority_config.priorities.get(camera_name, 0) if camera_name else 0
+        return max(camera_id_priority, camera_name_priority)
+
+    async def _get_camera_name(self, event: Event) -> str | None:
+        if not self._priority_config.priorities or self._protect is None:
+            return getattr(event, "camera_name", None)
+        try:
+            return await get_camera_name(self._protect, event.camera_id)
+        except Exception as e:
+            logger.warning(f"Unable to resolve camera name for priority matching: {event.camera_id}", exc_info=e)
+            return None
+
+
+class VideoQueue(asyncio.Queue):
+    """A byte-limited upload queue that can prioritize selected cameras."""
+
+    def __init__(
+        self,
+        maxsize=0,
+        *,
+        protect: ProtectApiClient | None = None,
+        priority_config: CameraPriorityConfig | None = None,
+        priority_aging_seconds: int = DEFAULT_PRIORITY_AGING_SECONDS,
+    ):
+        """Init."""
+        super().__init__(maxsize=maxsize)
         self._bytes_sum = 0
+        self._protect = protect
+        self._priority_config = priority_config or CameraPriorityConfig({})
+        self._priority_aging_seconds = priority_aging_seconds
+        self._sequence = 0
+
+    def _init(self, maxsize):
+        self._queue = []
 
     def qsize(self):
-        """Get number of items in the queue."""
+        """Get number of bytes in the queue."""
         return self._bytes_sum
 
     def qsize_files(self):
-        """Get number of items in the queue."""
-        return super().qsize()
+        """Get number of files in the queue."""
+        return len(self._queue)
 
     def _get(self):
-        data = self._queue.popleft()
-        self._bytes_sum -= len(data[1])
-        return data
+        index = self._best_item_index()
+        data = self._queue.pop(index)
+        self._bytes_sum -= len(data.video)
 
-    def _put(self, item: tuple[Event, bytes]):
-        self._queue.append(item)  # type: ignore
-        self._bytes_sum += len(item[1])
+        normal_events_ahead = 0
+        if data.base_priority > 0:
+            normal_events_ahead = sum(1 for item in self._queue[:index] if item.base_priority == 0)
+        if normal_events_ahead:
+            logger.debug(
+                f"Priority queue selected high-priority event before {normal_events_ahead} normal-priority events"
+            )
 
-    def full(self, item: tuple[Event, bytes] | None = None):
+        return data.event, data.video
+
+    def _put(self, item: _UploadQueueItem):
+        self._queue.append(item)
+        self._bytes_sum += len(item.video)
+
+    def _best_item_index(self) -> int:
+        now = time.monotonic()
+        best_index = 0
+        best_key = self._priority_key(self._queue[0], now)
+        for index, item in enumerate(self._queue[1:], start=1):
+            key = self._priority_key(item, now)
+            if key > best_key:
+                best_index = index
+                best_key = key
+        return best_index
+
+    def _priority_key(self, item: _UploadQueueItem, now: float) -> tuple[float, int]:
+        age_priority = 0
+        if self._priority_aging_seconds > 0:
+            age_priority = (now - item.enqueued_at) / self._priority_aging_seconds
+        return item.base_priority + age_priority, -item.sequence
+
+    def _item_size(self, item: tuple[Event, bytes] | _UploadQueueItem):
+        if isinstance(item, _UploadQueueItem):
+            return len(item.video)
+        return len(item[1])
+
+    def full(self, item: tuple[Event, bytes] | _UploadQueueItem | None = None):
         """Return True if there are maxsize bytes in the queue.
 
         optionally if `item` is provided, it will return False if there is enough space to
@@ -428,7 +674,7 @@ class VideoQueue(asyncio.Queue):
             if item is None:
                 return self.qsize() >= self._maxsize  # type: ignore
             else:
-                return self.qsize() + len(item[1]) >= self._maxsize  # type: ignore
+                return self.qsize() + self._item_size(item) >= self._maxsize  # type: ignore
 
     async def put(self, item: tuple[Event, bytes]):
         """Put an item into the queue.
@@ -436,13 +682,15 @@ class VideoQueue(asyncio.Queue):
         Put an item into the queue. If the queue is full, wait until a free
         slot is available before adding item.
         """
-        if len(item[1]) > self._maxsize:  # type: ignore
+        if self._maxsize > 0 and len(item[1]) > self._maxsize:  # type: ignore
             raise ValueError(
                 f"Item is larger ({human_readable_size(len(item[1]))}) "
                 f"than the size of the buffer ({human_readable_size(self._maxsize)})"  # type: ignore
             )
 
-        while self.full(item):
+        queue_item = await self._queue_item(item)
+
+        while self.full(queue_item):
             putter = self._get_loop().create_future()  # type: ignore
             self._putters.append(putter)  # type: ignore
             try:
@@ -456,24 +704,70 @@ class VideoQueue(asyncio.Queue):
                     # The putter could be removed from self._putters by a
                     # previous get_nowait call.
                     pass
-                if not self.full(item) and not putter.cancelled():
+                if not self.full(queue_item) and not putter.cancelled():
                     # We were woken up by get_nowait(), but can't take
                     # the call.  Wake up the next in line.
                     self._wakeup_next(self._putters)  # type: ignore
                 raise
-        return self.put_nowait(item)
+        return self._put_queue_item_nowait(queue_item)
 
     def put_nowait(self, item: tuple[Event, bytes]):
         """Put an item into the queue without blocking.
 
         If no free slot is immediately available, raise QueueFull.
         """
-        if self.full(item):
+        queue_item = self._queue_item_nowait(item)
+        if self.full(queue_item):
             raise asyncio.QueueFull
-        self._put(item)
+        self._put_queue_item_nowait(queue_item)
+
+    def _put_queue_item_nowait(self, queue_item: _UploadQueueItem):
+        self._put(queue_item)
         self._unfinished_tasks += 1  # type: ignore
         self._finished.clear()  # type: ignore
         self._wakeup_next(self._getters)  # type: ignore
+
+    async def _queue_item(self, item: tuple[Event, bytes]) -> _UploadQueueItem:
+        event, video = item
+        camera_name = await self._get_camera_name(event)
+        return self._build_queue_item(event, video, camera_name)
+
+    def _queue_item_nowait(self, item: tuple[Event, bytes]) -> _UploadQueueItem:
+        event, video = item
+        camera_name = getattr(event, "camera_name", None)
+        return self._build_queue_item(event, video, camera_name)
+
+    def _build_queue_item(self, event: Event, video: bytes, camera_name: str | None) -> _UploadQueueItem:
+        priority = self._camera_priority(event, camera_name)
+        setattr(event, "_upload_queue_priority", priority)
+        setattr(event, "_upload_queue_camera_name", camera_name)
+        queue_item = _UploadQueueItem(
+            event=event,
+            video=video,
+            base_priority=priority,
+            sequence=self._sequence,
+            enqueued_at=time.monotonic(),
+            camera_name=camera_name,
+        )
+        self._sequence += 1
+        logger.debug(
+            f'Queued upload event {event.id} camera="{camera_name or event.camera_id}" priority={priority}'
+        )
+        return queue_item
+
+    def _camera_priority(self, event: Event, camera_name: str | None) -> int:
+        camera_id_priority = self._priority_config.priorities.get(event.camera_id, 0)
+        camera_name_priority = self._priority_config.priorities.get(camera_name, 0) if camera_name else 0
+        return max(camera_id_priority, camera_name_priority)
+
+    async def _get_camera_name(self, event: Event) -> str | None:
+        if not self._priority_config.priorities or self._protect is None:
+            return getattr(event, "camera_name", None)
+        try:
+            return await get_camera_name(self._protect, event.camera_id)
+        except Exception as e:
+            logger.warning(f"Unable to resolve camera name for priority matching: {event.camera_id}", exc_info=e)
+            return None
 
 
 async def wait_until(dt):
