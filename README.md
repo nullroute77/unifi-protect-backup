@@ -245,6 +245,7 @@ always take priority over environment variables):
 - `PARALLEL_UPLOADS`
 - `PRIORITY_CAMERAS`
 - `CAMERA_PRIORITIES`
+- `PRIORITY_AGING_SECONDS`
 
 ## File path formatting
 
@@ -325,6 +326,7 @@ CAMERA_PRIORITIES="MB Registers=100,BS Registers=90,MB Entrance=50"
 ```
 
 FIFO order is preserved within the same priority, and older normal-priority events age upward so they are not starved by constant high-priority traffic.
+Set `PRIORITY_AGING_SECONDS` to control how quickly aging raises effective priority. The default is `600`, meaning an event gains one effective priority point every 10 minutes.
 
 # A note about `rclone` backends and disk wear
 This tool attempts to not write the downloaded files to disk to minimise disk wear, and instead streams them directly to 

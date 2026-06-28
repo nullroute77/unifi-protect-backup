@@ -19,7 +19,7 @@ from unifi_protect_backup import notifications
 logger = logging.getLogger(__name__)
 
 DEFAULT_PRIORITY_CAMERA_PRIORITY = 100
-DEFAULT_PRIORITY_AGING_SECONDS = 60
+DEFAULT_PRIORITY_AGING_SECONDS = 600
 
 
 def add_logging_level(levelName: str, levelNum: int, methodName: Optional[str] = None) -> None:

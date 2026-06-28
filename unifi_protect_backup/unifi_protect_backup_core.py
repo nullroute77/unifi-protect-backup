@@ -81,6 +81,7 @@ class UnifiProtectBackup:
         parallel_uploads: int = 1,
         priority_cameras: str = "",
         camera_priorities: str = "",
+        priority_aging_seconds: int = 600,
     ):
         """Will configure logging settings and the Unifi Protect API (but not actually connect).
 
@@ -121,6 +122,7 @@ class UnifiProtectBackup:
             parallel_uploads (int): Max number of parallel uploads to allow
             priority_cameras (str): Comma-separated camera names/IDs with default high upload priority
             camera_priorities (str): Comma-separated camera=priority mappings
+            priority_aging_seconds (int): Seconds of queue age needed to add one effective priority point
 
         """
         self.color_logging = color_logging
@@ -164,6 +166,7 @@ class UnifiProtectBackup:
         logger.debug(f"  {parallel_uploads=}")
         logger.debug(f"  {priority_cameras=}")
         logger.debug(f"  {camera_priorities=}")
+        logger.debug(f"  {priority_aging_seconds=}")
 
         self.rclone_destination = rclone_destination
         self.retention = retention
@@ -202,6 +205,7 @@ class UnifiProtectBackup:
         self._use_experimental_downloader = use_experimental_downloader
         self._parallel_uploads = parallel_uploads
         self._priority_config = parse_camera_priority_config(priority_cameras, camera_priorities)
+        self._priority_aging_seconds = priority_aging_seconds
 
     async def start(self):
         """Bootstrap the backup process and kick off the main loop.
@@ -267,11 +271,13 @@ class UnifiProtectBackup:
             download_queue = EventQueue(
                 protect=self._protect,
                 priority_config=self._priority_config,
+                priority_aging_seconds=self._priority_aging_seconds,
             )
             upload_queue = VideoQueue(
                 self._download_buffer_size,
                 protect=self._protect,
                 priority_config=self._priority_config,
+                priority_aging_seconds=self._priority_aging_seconds,
             )
 
             # Enable foreign keys in the database

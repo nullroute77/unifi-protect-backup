@@ -50,6 +50,7 @@ ENV TZ=UTC
 ENV IGNORE_CAMERAS=""
 ENV PRIORITY_CAMERAS=""
 ENV CAMERA_PRIORITIES=""
+ENV PRIORITY_AGING_SECONDS=600
 ENV SQLITE_PATH=/config/database/events.sqlite
 
 # Fixes issue where `platformdirs` is unable to properly detect the user directory

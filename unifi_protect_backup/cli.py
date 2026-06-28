@@ -273,6 +273,14 @@ a lot of failed downloads with the default downloader.
     envvar="CAMERA_PRIORITIES",
     help="Comma-separated camera priority mappings, e.g. 'Camera Name=100,camera_id=90'",
 )
+@click.option(
+    "--priority-aging-seconds",
+    default=600,
+    show_default=True,
+    envvar="PRIORITY_AGING_SECONDS",
+    type=int,
+    help="Seconds of queue age needed to add one effective priority point",
+)
 def main(**kwargs):
     """Python based tool for backing up Unifi Protect event clips as they occur."""
     try:
